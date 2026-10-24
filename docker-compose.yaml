@@ -1,0 +1,148 @@
+name: ddia-hw-1
+
+x-python: &python
+  image: ddia-hw-1-python:1.0.0
+  build:
+    context: .
+    target: runtime
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  mem_limit: 256m
+  cpus: 0.75
+
+x-app-env: &app-env
+  DEPLOYMENT: ${DEPLOYMENT:-ddia-hw-1}
+  APP_ERROR_RATE: ${APP_ERROR_RATE:-0.02}
+
+x-app-health: &app-health
+  test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+  interval: 5s
+  timeout: 4s
+  retries: 20
+  start_period: 10s
+
+services:
+  credentials:
+    <<: *python
+    user: '0:0'
+    command: [python, -m, tools.credentials]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    environment:
+      GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+    volumes:
+      - credentials:/run/credentials
+    restart: 'no'
+
+  app-1:
+    <<: *python
+    environment:
+      <<: *app-env
+      POD_ID: pod-1
+      DATACENTER: dc-east
+    healthcheck: *app-health
+    ports: ['127.0.0.1:8001:8000']
+    restart: unless-stopped
+
+  app-2:
+    <<: *python
+    environment:
+      <<: *app-env
+      POD_ID: pod-2
+      DATACENTER: dc-west
+    healthcheck: *app-health
+    ports: ['127.0.0.1:8002:8000']
+    restart: unless-stopped
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.122.0
+    command:
+      - -storageDataPath=/storage
+      - -retentionPeriod=1d
+      - -promscrape.config=/etc/victoriametrics/scrape.yaml
+      - -memory.allowedBytes=256MB
+      - -search.latencyOffset=1s
+    volumes:
+      - metrics-data:/storage
+      - ./monitoring/scrape.yaml:/etc/victoriametrics/scrape.yaml:ro
+    ports: ['127.0.0.1:8428:8428']
+    depends_on:
+      app-1: {condition: service_healthy}
+      app-2: {condition: service_healthy}
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/credentials/grafana-password
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+    group_add: ['472']
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - credentials:/run/credentials:ro
+      - ./monitoring/grafana/datasources.yaml:/etc/grafana/provisioning/datasources/vm.yaml:ro
+    ports: ['127.0.0.1:3000:3000']
+    depends_on:
+      credentials: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://localhost:3000/api/health]
+      interval: 5s
+      timeout: 4s
+      retries: 40
+      start_period: 20s
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+  bootstrap:
+    <<: *python
+    command: [python, -m, tools.bootstrap]
+    volumes:
+      - credentials:/run/credentials:ro
+      - generator-token:/run/grafana-token
+    depends_on:
+      app-1: {condition: service_healthy}
+      app-2: {condition: service_healthy}
+      grafana: {condition: service_healthy}
+      victoriametrics: {condition: service_started}
+    restart: 'no'
+
+  dashboard-generator:
+    <<: *python
+    command: [python, -m, tools.dashboard]
+    volumes:
+      - generator-token:/run/grafana-token:ro
+    depends_on:
+      app-1: {condition: service_healthy}
+      app-2: {condition: service_healthy}
+      grafana: {condition: service_healthy}
+      bootstrap: {condition: service_completed_successfully}
+    restart: 'no'
+
+  load:
+    <<: *python
+    command: [python, -m, tools.load]
+    environment:
+      LOAD_TARGET_RPS: ${LOAD_TARGET_RPS:-30}
+      LOAD_RAMP_SECONDS: ${LOAD_RAMP_SECONDS:-120}
+      LOAD_ERROR_RATE: ${LOAD_ERROR_RATE:-0.03}
+      LOAD_CONCURRENCY: '20'
+    depends_on:
+      dashboard-generator: {condition: service_completed_successfully}
+      app-1: {condition: service_healthy}
+      app-2: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  credentials:
+  generator-token:
+  grafana-data:
+  metrics-data:

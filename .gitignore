@@ -1,0 +1,12 @@
+.env
+grafana-password.txt
+.venv/
+.local/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+artifacts/*
+!artifacts/dashboard.jpg
+*.log
+.DS_Store
